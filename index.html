@@ -1,0 +1,215 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Simple 1-to-1 WebRTC on Cloudflare</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, Arial; padding: 12px; }
+    .controls { margin-bottom: 10px; }
+    video { width: 48%; max-width: 480px; background: #000; border-radius:8px; }
+    .videos { display:flex; gap:8px; flex-wrap:wrap; }
+    #status { margin-top:8px; color: #444; font-size:0.9rem; }
+    input[type=text] { width: 200px; }
+  </style>
+</head>
+<body>
+  <h2>Simple 1↔1 WebRTC Room (Cloudflare DO signaling)</h2>
+
+  <div class="controls">
+    <label>Room: <input id="room" type="text" value="default" /></label>
+    <button id="join">Join</button>
+    <button id="leave" disabled>Leave</button>
+  </div>
+
+  <div class="videos">
+    <video id="local" autoplay muted playsinline></video>
+    <video id="remote" autoplay playsinline></video>
+  </div>
+
+  <div id="status">Not connected</div>
+
+<script>
+/*
+CONFIG: set this to the worker domain you'll deploy (see wrangler deploy).
+If you publish your Worker to workers.dev, it'll be something like:
+  my-signaler.YOUR_ACCOUNT.workers.dev
+
+Client will connect to:
+  wss://WORKERS_SUBDOMAIN/ws?room=ROOMNAME&id=CLIENTID
+*/
+const WORKERS_SUBDOMAIN = 'miniwebrtc.huskysatyrfy.workers.dev'; // <- CHANGE THIS
+
+const statusEl = document.getElementById('status');
+const localVideo = document.getElementById('local');
+const remoteVideo = document.getElementById('remote');
+const joinBtn = document.getElementById('join');
+const leaveBtn = document.getElementById('leave');
+const roomInput = document.getElementById('room');
+
+let localStream = null;
+let pc = null;
+let ws = null;
+let clientId = Math.random().toString(36).slice(2,9);
+let roomName = null;
+
+function setStatus(t) { statusEl.textContent = t; }
+
+async function ensureMedia() {
+  if (!localStream) {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localVideo.srcObject = localStream;
+    } catch (e) {
+      alert('Camera / Microphone access required: ' + e.message);
+      throw e;
+    }
+  }
+}
+
+/* ICE servers — STUN only (public). Add TURN if you deploy one. */
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+function createPeerConnection() {
+  const connection = new RTCPeerConnection(RTC_CONFIG);
+
+  // Add local tracks
+  localStream.getTracks().forEach(t => connection.addTrack(t, localStream));
+
+  // Remote stream
+  const remoteStream = new MediaStream();
+  remoteVideo.srcObject = remoteStream;
+
+  connection.ontrack = (ev) => {
+    // Attach tracks from remote
+    ev.streams[0].getTracks().forEach(t => remoteStream.addTrack(t));
+  };
+
+  connection.onicecandidate = (ev) => {
+    if (ev.candidate) {
+      sendSignal({ type: 'ice', to: 'peer', from: clientId, candidate: ev.candidate });
+    }
+  };
+
+  connection.onconnectionstatechange = () => {
+    setStatus('Peer connection: ' + connection.connectionState);
+    if (connection.connectionState === 'failed' || connection.connectionState === 'closed' || connection.connectionState === 'disconnected') {
+      // cleanup
+    }
+  };
+
+  return connection;
+}
+
+function sendSignal(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify(obj));
+}
+
+// Handle signaling messages from Durable Object
+async function handleSignal(ev) {
+  const data = JSON.parse(ev.data);
+  // messages used:
+  // { type:'welcome', id }
+  // { type:'join-ack', peers: ['id1','id2'] }  // list of peers in room
+  // { type:'offer', from, sdp }
+  // { type:'answer', from, sdp }
+  // { type:'ice', from, candidate }
+  // { type:'peer-left', peerId }
+
+  console.log('signal ->', data);
+
+  if (data.type === 'welcome') {
+    // server welcome (not used)
+  } else if (data.type === 'join-ack') {
+    // If there's another peer already, initiate offer to the first other peer.
+    const others = data.peers.filter(p => p !== clientId);
+    if (others.length > 0) {
+      // for 1:1, contact first other peer
+      const other = others[0];
+      pc = createPeerConnection();
+      // create offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sendSignal({ type:'offer', to: other, from: clientId, sdp: offer });
+      setStatus('Created offer to ' + other);
+    } else {
+      setStatus('Waiting for peer in room...');
+    }
+  } else if (data.type === 'offer' && data.to === clientId) {
+    // incoming offer from peer
+    const from = data.from;
+    pc = createPeerConnection();
+    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sendSignal({ type:'answer', to: from, from: clientId, sdp: answer });
+    setStatus('Sent answer to ' + from);
+  } else if (data.type === 'answer' && data.to === clientId) {
+    await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+    setStatus('Received answer — connection in progress');
+  } else if (data.type === 'ice' && data.to === clientId) {
+    if (!pc) return;
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+    } catch (e) {
+      console.warn('addIceCandidate failed', e);
+    }
+  } else if (data.type === 'peer-left') {
+    setStatus('Peer left: ' + data.peerId);
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+    remoteVideo.srcObject = null;
+  }
+}
+
+function openWebSocket(room, id) {
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${scheme}://${WORKERS_SUBDOMAIN}/ws?room=${encodeURIComponent(room)}&id=${encodeURIComponent(id)}`;
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    setStatus('Signaling connected — joined room: ' + room);
+    // announce join to get peers list
+    sendSignal({ type: 'join', from: clientId });
+  };
+  ws.onmessage = handleSignal;
+  ws.onclose = () => { setStatus('Signaling closed'); leaveRoom(); };
+  ws.onerror = (e) => console.error('ws error', e);
+}
+
+async function joinRoom() {
+  if (!WORKERS_SUBDOMAIN || WORKERS_SUBDOMAIN.includes('REPLACE_WITH')) {
+    alert('Update WORKERS_SUBDOMAIN in the client to your worker domain.');
+    return;
+  }
+  roomName = (roomInput.value || 'default').trim();
+  await ensureMedia();
+  openWebSocket(roomName, clientId);
+  joinBtn.disabled = true;
+  leaveBtn.disabled = false;
+  roomInput.disabled = true;
+}
+
+function leaveRoom() {
+  if (pc) { pc.close(); pc = null; }
+  if (ws) { ws.close(); ws = null; }
+  remoteVideo.srcObject = null;
+  joinBtn.disabled = false;
+  leaveBtn.disabled = true;
+  roomInput.disabled = false;
+  setStatus('Left room');
+}
+
+joinBtn.addEventListener('click', joinRoom);
+leaveBtn.addEventListener('click', leaveRoom);
+
+// optionally auto-join if ?room=... set
+const params = new URLSearchParams(location.search);
+if (params.get('room')) {
+  roomInput.value = params.get('room');
+}
+</script>
+</body>
+</html>
